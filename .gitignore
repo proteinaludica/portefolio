@@ -1,0 +1,10 @@
+# Ficheiros com posições reais: nunca enviar para o GitHub
+*.csv
+!portefolio_exemplo.csv
+
+# Ficheiros temporários do Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.streamlit/secrets.toml
