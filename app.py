@@ -33,7 +33,12 @@ COLUNAS = {
     "setor": ["setor", "sector"],
     "pais": ["pais", "country"],
 }
+COLUNAS_OPCIONAIS = {
+    "data_compra": ["data de compra", "data da compra", "data compra", "data"],
+}
+PERIODOS = {"3 meses": "3mo", "12 meses": "1y", "5 anos": "5y"}
 NOMES_BONITOS = {
+    "data_compra": "Data de Compra",
     "ticker": "Ticker",
     "quantidade": "Quantidade",
     "preco_medio": "Preço Médio de Compra",
@@ -86,7 +91,7 @@ def ler_csv(ficheiro) -> pd.DataFrame:
     mapa = {}
     for coluna in df.columns:
         chave = normalizar(coluna)
-        for interno, variantes in COLUNAS.items():
+        for interno, variantes in (COLUNAS | COLUNAS_OPCIONAIS).items():
             if chave in variantes:
                 mapa[coluna] = interno
     df = df.rename(columns=mapa)
@@ -95,7 +100,17 @@ def ler_csv(ficheiro) -> pd.DataFrame:
     if em_falta:
         raise ValueError("Faltam colunas no ficheiro: " + ", ".join(em_falta))
 
-    df = df[list(COLUNAS)].copy()
+    if "data_compra" not in df.columns:
+        df["data_compra"] = None
+    df = df[list(COLUNAS) + ["data_compra"]].copy()
+    bruto = df["data_compra"]
+    df["data_compra"] = pd.to_datetime(bruto, dayfirst=True, errors="coerce", format="mixed")
+    datas_ma = bruto.notna() & df["data_compra"].isna()
+    if datas_ma.any():
+        st.warning(
+            f"{int(datas_ma.sum())} data(s) de compra não foram entendidas e serão ignoradas. "
+            "Use o formato dd/mm/aaaa."
+        )
     df["quantidade"] = df["quantidade"].map(para_numero)
     df["preco_medio"] = df["preco_medio"].map(para_numero)
     for c in ("ticker", "tipo", "setor", "pais"):
@@ -252,7 +267,7 @@ def _limpar_serie(serie: pd.Series) -> pd.Series:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def buscar_historico(simbolos: tuple, periodo: str = "1y") -> pd.DataFrame:
-    """Preços de fecho diários dos últimos 12 meses, em euros.
+    """Preços de fecho diários do período pedido (3mo, 1y, 5y), em euros.
 
     Uma coluna por símbolo. Os símbolos sem dados ficam de fora. Os preços
     estão ajustados a dividendos e desdobramentos (retorno total).
@@ -297,6 +312,32 @@ def retornos_carteira(precos: pd.DataFrame, pesos: pd.Series) -> pd.Series:
     return (retornos.fillna(0) * pesos_dia).sum(axis=1)
 
 
+def retornos_reais(precos: pd.DataFrame, lotes: pd.DataFrame) -> pd.Series:
+    """Retornos diários da carteira real, com as quantidades e datas de compra.
+
+    Cada lote (linha do CSV) entra na carteira na data de compra. Lotes sem data
+    contam desde o início do período. A compra no próprio dia não conta como
+    retorno (retorno ponderado no tempo): só mexe o preço dos activos já detidos.
+    """
+    p = precos.sort_index().ffill()
+    valor = pd.Series(0.0, index=p.index)
+    entradas = pd.Series(0.0, index=p.index)
+    for _, lote in lotes.iterrows():
+        if lote["simbolo"] not in p.columns:
+            continue
+        preco = p[lote["simbolo"]]
+        activo = preco.notna()
+        if pd.notna(lote["data_compra"]):
+            activo = activo & (p.index >= lote["data_compra"])
+        valor_lote = preco.fillna(0.0) * lote["quantidade"] * activo
+        entrou = activo & ~activo.shift(1, fill_value=bool(activo.iloc[0]))
+        valor = valor + valor_lote
+        entradas = entradas + valor_lote * entrou
+    anterior = valor.shift(1)
+    retorno = (valor - entradas) / anterior - 1
+    return retorno.where(anterior > 0, 0.0).fillna(0.0)
+
+
 def curva_carteira(precos: pd.DataFrame, pesos: pd.Series) -> pd.Series:
     """Rentabilidade acumulada (%) da carteira com os pesos actuais constantes."""
     return ((1 + retornos_carteira(precos, pesos)).cumprod() - 1) * 100
@@ -314,7 +355,7 @@ def alinhar_benchmark(curva: pd.Series, benchmark: pd.Series):
     return c, b
 
 
-def grafico_evolucao(carteira_pct: pd.Series, bench_pct: pd.Series, nome_bench: str):
+def grafico_evolucao(carteira_pct: pd.Series, bench_pct: pd.Series, nome_bench: str, rotulo: str = "12 meses"):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=carteira_pct.index, y=carteira_pct, name="A minha carteira",
                              mode="lines", line=dict(width=3, color="#1f77b4")))
@@ -323,7 +364,7 @@ def grafico_evolucao(carteira_pct: pd.Series, bench_pct: pd.Series, nome_bench: 
     fig.add_hline(y=0, line_width=1, line_color="gray")
     fig.update_traces(hovertemplate="%{y:+.2f} %")
     fig.update_layout(
-        title="Performance acumulada (12 meses, em euros)",
+        title=f"Performance acumulada ({rotulo}, em euros)",
         hovermode="x unified",
         yaxis=dict(ticksuffix=" %", title="Retorno acumulado"),
         xaxis_title="",
@@ -443,6 +484,8 @@ with st.sidebar:
     usar_exemplo = st.checkbox("Usar dados de exemplo", disabled=not EXEMPLO.exists())
     tipo_grafico = st.radio("Tipo de gráfico", ["Pie Chart", "Treemap"])
     base_graficos = st.radio("Gráficos de alocação por", ["Valor actual", "Valor investido"])
+    st.header("Período de análise")
+    rotulo_periodo = st.selectbox("Histórico a analisar", list(PERIODOS), index=1)
     st.header("Benchmark")
     escolha = st.selectbox("Comparar com", list(BENCHMARKS) + ["Outro símbolo"])
     if escolha == "Outro símbolo":
@@ -495,14 +538,42 @@ elif not sem_preco.empty:
         + ". Confirme o símbolo (ex.: EDP.LS para Lisboa, VWCE.DE para Xetra)."
     )
 
-# Historial de 12 meses (usado no Dashboard e nas Métricas de Risco)
+# Historial do período escolhido (usado no Dashboard e nas Métricas de Risco)
+tem_datas = bool(carteira["data_compra"].notna().any())
+with st.sidebar:
+    modo_curva = st.radio(
+        "Curva da carteira",
+        ["Pesos actuais (simulação)", "Compras reais (usa a Data de Compra)"],
+        disabled=not tem_datas,
+        help="Compras reais precisa da coluna 'Data de Compra' no CSV.",
+    )
+modo_real = tem_datas and modo_curva.startswith("Compras reais")
+
 pesos_valor = carteira.dropna(subset=["simbolo"]).groupby("simbolo")["valor_atual"].sum()
 with st.spinner("A descarregar o historial de preços..."):
-    historico = buscar_historico(tuple(sorted(set(pesos_valor.index) | {simbolo_bench})))
+    historico = buscar_historico(
+        tuple(sorted(set(pesos_valor.index) | {simbolo_bench})), PERIODOS[rotulo_periodo]
+    )
 
 cobertos = [s for s in pesos_valor.index if s in historico.columns]
 historico_ok = bool(cobertos) and simbolo_bench in historico.columns
 pesos = pesos_valor[cobertos] / pesos_valor[cobertos].sum() if historico_ok else None
+lotes = carteira.dropna(subset=["simbolo"])[["simbolo", "quantidade", "data_compra"]]
+
+
+def retornos_do_modo(precos_df: pd.DataFrame) -> pd.Series:
+    """Retornos diários pela curva escolhida (compras reais ou pesos actuais)."""
+    if modo_real:
+        return retornos_reais(precos_df, lotes)
+    return retornos_carteira(precos_df, pesos)
+
+
+texto_metodo = (
+    "Usa as quantidades e as datas de compra reais; lotes sem data contam desde o início do período."
+    if modo_real
+    else "Aplica os pesos actuais (valor actual de cada posição), constantes, aos preços do período. "
+    "Não é o histórico real das compras."
+)
 texto_cobertura = ""
 if historico_ok:
     cobertura = pesos_valor[cobertos].sum() / carteira["valor_atual"].sum() * 100
@@ -533,13 +604,14 @@ with tab_dash:
     )
 
     mostrar = carteira[
-        ["ticker", "tipo", "quantidade", "preco_medio", "preco_atual",
+        ["ticker", "tipo", "data_compra", "quantidade", "preco_medio", "preco_atual",
          "valor_investido", "valor_atual", "pl_abs", "pl_pct", "estado"]
     ].rename(columns=NOMES_BONITOS | {"preco_medio": "Preço Médio de Compra (€)"})
     estilo = (
         mostrar.style.map(cor_pl, subset=["P&L (€)", "P&L (%)"])
         .format(
             {
+                "Data de Compra": lambda v: "—" if pd.isna(v) else f"{v:%d/%m/%Y}",
                 "Quantidade": "{:,.4f}".format,
                 "Preço Médio de Compra (€)": "{:,.2f}".format,
                 "Preço Actual (€)": lambda v: "—" if pd.isna(v) else f"{v:,.2f}",
@@ -554,31 +626,30 @@ with tab_dash:
     st.dataframe(estilo, width="stretch", hide_index=True)
     st.plotly_chart(grafico_pl(carteira), width="stretch")
 
-    st.subheader("📈 Evolução dos últimos 12 meses")
+    st.subheader(f"📈 Evolução ({rotulo_periodo})")
     if not cobertos:
         st.info("Não consegui obter o historial de nenhum activo da carteira.")
     elif simbolo_bench not in historico.columns:
         st.info(f"Não consegui obter o historial do benchmark {simbolo_bench}.")
     else:
-        par = alinhar_benchmark(curva_carteira(historico[cobertos], pesos), historico[simbolo_bench])
+        curva_modo = ((1 + retornos_do_modo(historico[cobertos])).cumprod() - 1) * 100
+        par = alinhar_benchmark(curva_modo, historico[simbolo_bench])
         if par is None:
             st.info("O benchmark não tem datas em comum com a carteira.")
         else:
             curva_c, curva_b = par
             ret_c, ret_b = curva_c.iloc[-1], curva_b.iloc[-1]
             k1, k2, k3 = st.columns(3)
-            k1.metric("Carteira (12 meses)", f"{ret_c:+.2f} %")
+            k1.metric(f"Carteira ({rotulo_periodo})", f"{ret_c:+.2f} %")
             k2.metric(nome_bench, f"{ret_b:+.2f} %")
             k3.metric("Diferença", f"{ret_c - ret_b:+.2f} p.p.", delta=f"{ret_c - ret_b:+.2f} p.p.")
             if ret_c >= ret_b:
                 st.success("A carteira bateu o benchmark neste período.")
             else:
                 st.warning("A carteira ficou abaixo do benchmark neste período.")
-            st.plotly_chart(grafico_evolucao(curva_c, curva_b, nome_bench), width="stretch")
+            st.plotly_chart(grafico_evolucao(curva_c, curva_b, nome_bench, rotulo_periodo), width="stretch")
             st.caption(
-                "Simulação: aplica os pesos actuais (valor actual de cada posição) aos preços dos "
-                "últimos 12 meses, com pesos constantes e dividendos incluídos. Não é o histórico "
-                "real das compras. " + texto_cobertura
+                f"{texto_metodo} Dividendos incluídos. " + texto_cobertura
             )
 
 # ------------------------------------------------------ Alocação Setor/País
@@ -601,7 +672,7 @@ with tab_aloc:
 
 # ------------------------------------------------------------ Métricas de risco
 with tab_risco:
-    st.subheader("⚠️ Análise de risco (últimos 12 meses)")
+    st.subheader(f"⚠️ Análise de risco ({rotulo_periodo})")
     taxa_pct = st.radio(
         "Taxa livre de risco (para o Sharpe Ratio)", [2, 3],
         format_func=lambda x: f"{x} %", horizontal=True,
@@ -610,7 +681,7 @@ with tab_risco:
         st.info("Preciso do historial da carteira e do benchmark para calcular o risco.")
     else:
         datas_bench = historico[simbolo_bench].dropna().index
-        ret_carteira = retornos_carteira(historico[cobertos].ffill().reindex(datas_bench), pesos)
+        ret_carteira = retornos_do_modo(historico[cobertos].ffill().reindex(datas_bench))
         ret_bench = historico[simbolo_bench].dropna().pct_change()
         r = metricas_risco(ret_carteira, ret_bench, taxa_pct / 100)
         if r is None:
@@ -627,7 +698,7 @@ with tab_risco:
                       help=f"Retorno acima da taxa livre de risco ({taxa_pct} %) por cada unidade de "
                            "volatilidade. Acima de 1 é bom. Abaixo de 0 é pior que a taxa livre de risco.")
             r4.metric("Queda máxima", f"{c['queda_maxima'] * 100:.2f} %",
-                      help="A maior descida desde um máximo até ao mínimo seguinte, no último ano.")
+                      help="A maior descida desde um máximo até ao mínimo seguinte, no período escolhido.")
 
             tabela = pd.DataFrame(
                 {
@@ -646,9 +717,14 @@ with tab_risco:
             st.plotly_chart(grafico_quedas(c["queda"], b["queda"], nome_bench), width="stretch")
             st.caption(
                 f"Calculado com {r['dias']} dias de negociação do benchmark, retornos diários e "
-                f"{DIAS_BOLSA} dias por ano, com os pesos actuais constantes. Mede o passado e não "
-                "prevê o futuro. " + texto_cobertura
+                f"{DIAS_BOLSA} dias por ano. {texto_metodo} Mede o passado e não prevê o futuro. "
+                + texto_cobertura
             )
+            if r["dias"] < 120:
+                st.warning(
+                    "Período curto: com menos de 6 meses, a volatilidade anualizada e o Sharpe "
+                    "são pouco fiáveis. Use-os só como indicação."
+                )
             with st.expander("O que significa cada métrica"):
                 st.markdown(
                     "- **Volatilidade anualizada:** desvio-padrão dos retornos diários multiplicado "
