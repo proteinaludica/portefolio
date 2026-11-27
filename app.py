@@ -1,11 +1,15 @@
 """Análise de portefólio de investimentos (Streamlit + Plotly + yfinance).
 
 Como correr:  streamlit run app.py
+
+O ficheiro CSV tem uma linha por operação (compra ou venda). As vendas
+consomem primeiro as compras mais antigas, como na regra fiscal portuguesa.
 """
 
 import io
 import math
 import unicodedata
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -23,31 +27,37 @@ EXEMPLO = Path(__file__).parent / "portefolio_exemplo.csv"
 COLUNAS = {
     "ticker": ["ticker", "simbolo", "codigo"],
     "quantidade": ["quantidade", "qtd", "qty"],
-    "preco_medio": [
+    "preco": [
+        "preco unitario",
         "preco medio de compra",
         "preco medio",
         "preco de compra",
+        "preco",
         "pmc",
     ],
     "tipo": ["tipo de activo", "tipo de ativo", "tipo", "classe"],
     "setor": ["setor", "sector"],
     "pais": ["pais", "country"],
 }
-COLUNAS_OPCIONAIS = {
-    "data_compra": ["data de compra", "data da compra", "data compra", "data"],
-    "moeda": ["moeda", "moeda de compra", "currency", "divisa"],
+# Colunas que podem faltar (o CSV antigo continua a funcionar).
+OPCIONAIS = {
+    "operacao": ["operacao", "tipo de operacao", "movimento"],
+    "data": ["data", "data de compra", "data da operacao", "data de operacao"],
+    "comissoes": ["comissoes", "comissao", "custos", "taxas"],
+    "moeda": ["moeda", "moeda da operacao", "currency", "divisa"],
 }
-MOEDAS_SIMBOLO = {"€": "EUR", "$": "USD", "£": "GBP"}
-PERIODOS = {"3 meses": "3mo", "12 meses": "1y", "5 anos": "5y"}
 NOMES_BONITOS = {
-    "data_compra": "Data de Compra",
-    "moeda": "Moeda",
     "ticker": "Ticker",
     "quantidade": "Quantidade",
+    "preco": "Preço Unitário",
     "preco_medio": "Preço Médio de Compra",
     "tipo": "Tipo de Activo",
     "setor": "Setor",
     "pais": "País",
+    "operacao": "Operação",
+    "data": "Data",
+    "comissoes": "Comissões",
+    "moeda": "Moeda",
     "preco_atual": "Preço Actual (€)",
     "valor_investido": "Valor Investido (€)",
     "valor_atual": "Valor Actual (€)",
@@ -55,6 +65,8 @@ NOMES_BONITOS = {
     "pl_pct": "P&L (%)",
     "estado": "Estado do preço",
 }
+MOEDAS_SIMBOLO = {"€": "EUR", "$": "USD", "£": "GBP"}
+FORMATOS_DATA = ["%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y-%m-%d", "%d/%m/%y"]
 
 
 # ------------------------------------------------------------------ leitura
@@ -70,6 +82,8 @@ def para_numero(valor) -> float:
     if pd.isna(valor):
         return float("nan")
     texto = str(valor).strip().replace("€", "").replace("$", "").replace(" ", "")
+    if texto == "":
+        return float("nan")
     if "," in texto and "." in texto:
         texto = texto.replace(".", "").replace(",", ".")
     elif "," in texto:
@@ -80,8 +94,33 @@ def para_numero(valor) -> float:
         return float("nan")
 
 
+def para_data(valor):
+    """Converte '15/03/2024', '15-03-2024' ou '2024-03-15' em data.
+
+    Devolve None se a célula estiver vazia e NaT se a data for inválida.
+    """
+    if pd.isna(valor) or str(valor).strip() == "":
+        return None
+    texto = str(valor).strip().split(" ")[0]
+    for formato in FORMATOS_DATA:
+        try:
+            return pd.Timestamp(datetime.strptime(texto, formato))
+        except ValueError:
+            continue
+    return pd.NaT
+
+
+def para_operacao(valor):
+    texto = normalizar(valor) if not pd.isna(valor) else ""
+    if texto in ("", "compra", "c", "buy", "compras"):
+        return "Compra"
+    if texto in ("venda", "v", "sell", "vendas"):
+        return "Venda"
+    return None
+
+
 def ler_csv(ficheiro) -> pd.DataFrame:
-    """Lê o CSV (vírgula ou ponto e vírgula; UTF-8 ou Excel antigo)."""
+    """Lê o CSV de operações (vírgula ou ponto e vírgula; UTF-8 ou Excel antigo)."""
     conteudo = ficheiro.read() if hasattr(ficheiro, "read") else ficheiro
     if isinstance(conteudo, str):
         conteudo = conteudo.encode("utf-8")
@@ -94,48 +133,78 @@ def ler_csv(ficheiro) -> pd.DataFrame:
     mapa = {}
     for coluna in df.columns:
         chave = normalizar(coluna)
-        for interno, variantes in (COLUNAS | COLUNAS_OPCIONAIS).items():
-            if chave in variantes:
+        for interno, variantes in (COLUNAS | OPCIONAIS).items():
+            if chave in variantes and interno not in mapa.values():
                 mapa[coluna] = interno
     df = df.rename(columns=mapa)
 
     em_falta = [NOMES_BONITOS[c] for c in COLUNAS if c not in df.columns]
     if em_falta:
         raise ValueError("Faltam colunas no ficheiro: " + ", ".join(em_falta))
+    for c in OPCIONAIS:
+        if c not in df.columns:
+            df[c] = None
 
-    for opcional in ("data_compra", "moeda"):
-        if opcional not in df.columns:
-            df[opcional] = None
-    df = df[list(COLUNAS) + ["data_compra", "moeda"]].copy()
-    df["moeda"] = (
-        df["moeda"].fillna("EUR").str.strip().replace("", "EUR").replace(MOEDAS_SIMBOLO).str.upper()
-    )
-    bruto = df["data_compra"]
-    df["data_compra"] = pd.to_datetime(bruto, dayfirst=True, errors="coerce", format="mixed")
-    datas_ma = bruto.notna() & df["data_compra"].isna()
-    if datas_ma.any():
-        st.warning(
-            f"{int(datas_ma.sum())} data(s) de compra não foram entendidas e serão ignoradas. "
-            "Use o formato dd/mm/aaaa."
-        )
+    df = df[list(COLUNAS) + list(OPCIONAIS)].copy()
+    df["linha"] = df.index + 2  # número da linha no ficheiro (1 = cabeçalho)
     df["quantidade"] = df["quantidade"].map(para_numero)
-    df["preco_medio"] = df["preco_medio"].map(para_numero)
+    df["preco"] = df["preco"].map(para_numero)
+    df["comissoes"] = df["comissoes"].map(para_numero).fillna(0.0)
+    df["operacao"] = df["operacao"].map(para_operacao)
+    df["moeda"] = (
+        df["moeda"].fillna("").astype(str).str.strip().str.upper()
+        .replace("", "EUR").replace(MOEDAS_SIMBOLO)
+    )
+    texto_data = df["data"].fillna("").astype(str).str.strip()
+    df["data"] = pd.to_datetime(texto_data.map(lambda t: para_data(t) or pd.NaT))
+    data_invalida = (texto_data != "") & df["data"].isna()
     for c in ("ticker", "tipo", "setor", "pais"):
         df[c] = df[c].fillna("Sem indicação").str.strip()
 
-    invalidas = df["quantidade"].isna() | df["preco_medio"].isna()
+    invalidas = (
+        df["quantidade"].isna()
+        | (df["quantidade"] <= 0)
+        | df["preco"].isna()
+        | df["operacao"].isna()
+        | data_invalida
+    )
     if invalidas.any():
+        linhas = ", ".join(str(n) for n in df.loc[invalidas, "linha"])
         st.warning(
-            f"{int(invalidas.sum())} linha(s) ignorada(s) por terem quantidade "
-            "ou preço inválidos."
+            f"{int(invalidas.sum())} linha(s) ignorada(s) por terem quantidade, preço, "
+            f"operação ou data inválidos (linhas {linhas} do ficheiro)."
         )
         df = df[~invalidas]
-
-    df["valor_investido"] = df["quantidade"] * df["preco_medio"]
+    df = converter_para_euros(df)
     return df.reset_index(drop=True)
 
 
-# ------------------------------------------------------------------- câmbio
+def converter_para_euros(df: pd.DataFrame) -> pd.DataFrame:
+    """Passa o preço e as comissões de cada operação para euros.
+
+    Usa o câmbio do dia da operação (ou o mais recente, se não houver data).
+    As operações cuja moeda não tem câmbio ficam de fora, com um aviso.
+    """
+    df = df.copy()
+    sem_cambio = []
+    for i, linha in df[df["moeda"] != "EUR"].iterrows():
+        data = "" if pd.isna(linha["data"]) else linha["data"].strftime("%Y-%m-%d")
+        taxa = buscar_cambio(linha["moeda"], data)
+        if taxa is None:
+            sem_cambio.append(i)
+            continue
+        df.at[i, "preco"] = linha["preco"] * taxa
+        df.at[i, "comissoes"] = linha["comissoes"] * taxa
+    if sem_cambio:
+        st.error(
+            "Sem câmbio para converter para euros nas linhas "
+            + ", ".join(str(n) for n in df.loc[sem_cambio, "linha"])
+            + ". Essas operações ficam de fora. Confirme a moeda (EUR, USD ou GBP)."
+        )
+        df = df.drop(index=sem_cambio)
+    return df
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def buscar_cambio(moeda: str, data: str) -> float | None:
     """Quantos euros vale 1 unidade da moeda, no último fecho até à data (aaaa-mm-dd).
@@ -156,37 +225,120 @@ def buscar_cambio(moeda: str, data: str) -> float | None:
         return None
 
 
-def aplicar_cambio(df: pd.DataFrame):
-    """Converte para euros o preço de compra das linhas noutra moeda.
+# ------------------------------------------------------- compras e vendas
+def processar_operacoes(ops: pd.DataFrame):
+    """Aplica as compras e as vendas a cada activo pela ordem das datas.
 
-    Usa o câmbio do dia da compra (ou o mais recente, se não houver data).
-    Devolve a tabela e a lista de conversões feitas, para mostrar ao utilizador.
+    As vendas consomem primeiro as compras mais antigas. As comissões somam-se
+    ao custo das compras e descontam-se no valor recebido nas vendas.
+    Devolve (posições actuais, vendas realizadas, avisos).
     """
-    df = df.copy()
-    conversoes, sem_cambio = [], []
-    for i, linha in df[df["moeda"] != "EUR"].iterrows():
-        data = "" if pd.isna(linha["data_compra"]) else linha["data_compra"].strftime("%Y-%m-%d")
-        taxa = buscar_cambio(linha["moeda"], data)
-        if taxa is None:
-            sem_cambio.append(i)
-            continue
-        original = linha["preco_medio"]
-        df.at[i, "preco_medio"] = original * taxa
-        conversoes.append(
-            {
-                "ticker": linha["ticker"], "original": original, "moeda": linha["moeda"],
-                "euros": original * taxa, "taxa": taxa, "data": data or "mais recente",
-            }
-        )
-    if sem_cambio:
-        st.error(
-            "Sem câmbio para converter para euros: "
-            + ", ".join(df.loc[sem_cambio, "ticker"])
-            + ". Estas posições ficam de fora até o Yahoo responder."
-        )
-        df = df.drop(index=sem_cambio)
-    df["valor_investido"] = df["quantidade"] * df["preco_medio"]
-    return df.reset_index(drop=True), conversoes
+    posicoes, vendas, avisos = [], [], []
+    ordenado = ops.assign(_venda=(ops["operacao"] == "Venda").astype(int))
+    ordenado = ordenado.sort_values(["data", "_venda", "linha"], na_position="first", kind="stable")
+
+    for ticker, g in ordenado.groupby("ticker", sort=False):
+        lotes = deque()  # cada lote: [quantidade, custo por unidade]
+        for _, op in g.iterrows():
+            q, p, fee = op["quantidade"], op["preco"], op["comissoes"]
+            if op["operacao"] == "Compra":
+                lotes.append([q, (q * p + fee) / q])
+                continue
+            restante, custo = q, 0.0
+            while restante > 1e-12 and lotes:
+                usar = min(restante, lotes[0][0])
+                custo += usar * lotes[0][1]
+                lotes[0][0] -= usar
+                restante -= usar
+                if lotes[0][0] <= 1e-12:
+                    lotes.popleft()
+            vendida = q - restante
+            if restante > 1e-9:
+                avisos.append(
+                    f"{ticker}: a venda da linha {op['linha']} é maior do que a quantidade "
+                    f"detida. Contei só {vendida:,.4f} unidades."
+                )
+            if vendida <= 0:
+                continue
+            receita = vendida * p - fee
+            vendas.append(
+                {
+                    "Ticker": ticker,
+                    "Data": op["data"],
+                    "Quantidade": vendida,
+                    "Valor Recebido (€)": receita,
+                    "Custo de Aquisição (€)": custo,
+                    "Ganho Realizado (€)": receita - custo,
+                }
+            )
+
+        quantidade = sum(l[0] for l in lotes)
+        if quantidade > 1e-9:
+            custo_total = sum(l[0] * l[1] for l in lotes)
+            ultima = g.iloc[-1]
+            posicoes.append(
+                {
+                    "ticker": ticker,
+                    "tipo": ultima["tipo"],
+                    "setor": ultima["setor"],
+                    "pais": ultima["pais"],
+                    "quantidade": quantidade,
+                    "preco_medio": custo_total / quantidade,
+                    "valor_investido": custo_total,
+                }
+            )
+
+    carteira = pd.DataFrame(
+        posicoes,
+        columns=["ticker", "tipo", "setor", "pais", "quantidade", "preco_medio", "valor_investido"],
+    )
+    vendas = pd.DataFrame(
+        vendas,
+        columns=["Ticker", "Data", "Quantidade", "Valor Recebido (€)",
+                 "Custo de Aquisição (€)", "Ganho Realizado (€)"],
+    )
+    return carteira, vendas, avisos
+
+
+def fluxo_operacao(op) -> float:
+    """Dinheiro que entra na carteira (compra, positivo) ou sai (venda, negativo)."""
+    if op["operacao"] == "Compra":
+        return op["quantidade"] * op["preco"] + op["comissoes"]
+    return -(op["quantidade"] * op["preco"] - op["comissoes"])
+
+
+def tir_anual(ops: pd.DataFrame, valor_final: float, hoje: pd.Timestamp, inicio: pd.Timestamp):
+    """Rentabilidade anual ponderada pelo dinheiro (taxa interna de rentabilidade).
+
+    Considera cada compra como dinheiro investido, cada venda como dinheiro
+    recebido e o valor actual da carteira como se fosse vendida hoje.
+    Devolve None com menos de 90 dias de historial ou sem solução.
+    """
+    fluxos = [
+        (inicio if pd.isna(op["data"]) else op["data"], -fluxo_operacao(op))
+        for _, op in ops.iterrows()
+    ]
+    fluxos.append((hoje, valor_final))
+    t0 = min(d for d, _ in fluxos)
+    if (hoje - t0).days < 90:
+        return None
+    pares = [((d - t0).days / 365.25, a) for d, a in fluxos]
+
+    def valor_presente(taxa):
+        return sum(a / (1 + taxa) ** t for t, a in pares)
+
+    baixo, alto = -0.99, 10.0
+    f_baixo, f_alto = valor_presente(baixo), valor_presente(alto)
+    if f_baixo * f_alto > 0:
+        return None
+    for _ in range(200):
+        meio = (baixo + alto) / 2
+        f_meio = valor_presente(meio)
+        if f_baixo * f_meio <= 0:
+            alto = meio
+        else:
+            baixo, f_baixo = meio, f_meio
+    return (baixo + alto) / 2
 
 
 # ------------------------------------------------------------ dados de mercado
@@ -327,8 +479,8 @@ def _limpar_serie(serie: pd.Series) -> pd.Series:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def buscar_historico(simbolos: tuple, periodo: str = "1y") -> pd.DataFrame:
-    """Preços de fecho diários do período pedido (3mo, 1y, 5y), em euros.
+def buscar_historico(simbolos: tuple, inicio: str) -> pd.DataFrame:
+    """Preços de fecho diários desde a data de início, em euros.
 
     Uma coluna por símbolo. Os símbolos sem dados ficam de fora. Os preços
     estão ajustados a dividendos e desdobramentos (retorno total).
@@ -338,7 +490,7 @@ def buscar_historico(simbolos: tuple, periodo: str = "1y") -> pd.DataFrame:
     for s in simbolos:
         try:
             ticker = yf.Ticker(s)
-            hist = _limpar_serie(ticker.history(period=periodo, auto_adjust=True)["Close"])
+            hist = _limpar_serie(ticker.history(start=inicio, auto_adjust=True)["Close"])
             moeda = ticker.fast_info["currency"]
             if hist.empty:
                 continue
@@ -346,7 +498,7 @@ def buscar_historico(simbolos: tuple, periodo: str = "1y") -> pd.DataFrame:
                 hist, moeda = hist / 100, "GBP"
             if moeda != "EUR":
                 if moeda not in taxas:
-                    cambio = yf.Ticker(f"{moeda}EUR=X").history(period=periodo)["Close"]
+                    cambio = yf.Ticker(f"{moeda}EUR=X").history(start=inicio)["Close"]
                     taxas[moeda] = _limpar_serie(cambio)
                 cambio = taxas[moeda]
                 if cambio.empty:
@@ -357,6 +509,58 @@ def buscar_historico(simbolos: tuple, periodo: str = "1y") -> pd.DataFrame:
         except Exception:
             continue
     return pd.DataFrame(series).sort_index() if series else pd.DataFrame()
+
+
+def evolucao_real(ops: pd.DataFrame, historico: pd.DataFrame, datas: pd.DatetimeIndex):
+    """Valor diário da carteira real, dinheiro investido e retornos diários.
+
+    Cada activo só entra na carteira no dia da compra e sai no dia da venda.
+    Uma operação feita num dia sem bolsa conta no dia de bolsa seguinte.
+    Os activos sem cotação (P2P ou símbolo não encontrado) contam ao custo.
+    O retorno diário retira o efeito do dinheiro que entra ou sai
+    (rentabilidade ponderada pelo tempo).
+    """
+    n = len(datas)
+    valor = pd.Series(0.0, index=datas)
+    compras_dia = pd.Series(0.0, index=datas)  # dinheiro gasto em compras
+    vendas_dia = pd.Series(0.0, index=datas)   # dinheiro recebido em vendas
+
+    for _, g in ops.groupby("ticker"):
+        simbolo = g["simbolo"].iloc[0]
+        posicao = g["data"].map(
+            lambda d: 0 if pd.isna(d) else min(int(datas.searchsorted(d)), n - 1)
+        )
+        sinal = g["operacao"].map({"Compra": 1.0, "Venda": -1.0})
+
+        delta = (g["quantidade"] * sinal).groupby(posicao).sum()
+        quantidade = pd.Series(0.0, index=range(n))
+        quantidade.loc[delta.index] = delta.values
+        quantidade = quantidade.cumsum().clip(lower=0)
+        quantidade.index = datas
+
+        if simbolo and simbolo in historico.columns:
+            preco = historico[simbolo].reindex(datas).ffill().bfill()
+        else:
+            compras = g[g["operacao"] == "Compra"]
+            unidades = compras["quantidade"].sum()
+            custo = (compras["quantidade"] * compras["preco"] + compras["comissoes"]).sum()
+            preco = pd.Series(custo / unidades if unidades else 0.0, index=datas)
+        valor += quantidade * preco
+
+        f = g.apply(fluxo_operacao, axis=1)
+        for serie, parte in ((compras_dia, f.clip(lower=0)), (vendas_dia, -f.clip(upper=0))):
+            soma = parte.groupby(posicao).sum()
+            serie.iloc[soma.index] = serie.iloc[soma.index].values + soma.values
+
+    # As compras contam no início do dia e as vendas no fim do dia. Assim, o
+    # retorno diário nunca fica abaixo de -100 %.
+    base = valor.shift(1).fillna(0.0) + compras_dia
+    retornos = ((valor + vendas_dia) / base - 1).where(base > 0, 0.0).fillna(0.0)
+    # O primeiro dia serve de ponto de partida. As operações sem data entram ao
+    # preço de mercado desse dia, como na versão anterior da aplicação.
+    if n:
+        retornos.iloc[0] = 0.0
+    return valor, compras_dia - vendas_dia, retornos
 
 
 def retornos_carteira(precos: pd.DataFrame, pesos: pd.Series) -> pd.Series:
@@ -373,37 +577,6 @@ def retornos_carteira(precos: pd.DataFrame, pesos: pd.Series) -> pd.Series:
     return (retornos.fillna(0) * pesos_dia).sum(axis=1)
 
 
-def retornos_reais(precos: pd.DataFrame, lotes: pd.DataFrame) -> pd.Series:
-    """Retornos diários da carteira real, com as quantidades e datas de compra.
-
-    Cada lote (linha do CSV) entra na carteira na data de compra. Lotes sem data
-    contam desde o início do período. A compra no próprio dia não conta como
-    retorno (retorno ponderado no tempo): só mexe o preço dos activos já detidos.
-    """
-    p = precos.sort_index().ffill()
-    valor = pd.Series(0.0, index=p.index)
-    entradas = pd.Series(0.0, index=p.index)
-    for _, lote in lotes.iterrows():
-        if lote["simbolo"] not in p.columns:
-            continue
-        preco = p[lote["simbolo"]]
-        activo = preco.notna()
-        if pd.notna(lote["data_compra"]):
-            activo = activo & (p.index >= lote["data_compra"])
-        valor_lote = preco.fillna(0.0) * lote["quantidade"] * activo
-        entrou = activo & ~activo.shift(1, fill_value=bool(activo.iloc[0]))
-        valor = valor + valor_lote
-        entradas = entradas + valor_lote * entrou
-    anterior = valor.shift(1)
-    retorno = (valor - entradas) / anterior - 1
-    return retorno.where(anterior > 0, 0.0).fillna(0.0)
-
-
-def curva_carteira(precos: pd.DataFrame, pesos: pd.Series) -> pd.Series:
-    """Rentabilidade acumulada (%) da carteira com os pesos actuais constantes."""
-    return ((1 + retornos_carteira(precos, pesos)).cumprod() - 1) * 100
-
-
 def alinhar_benchmark(curva: pd.Series, benchmark: pd.Series):
     """Põe carteira e benchmark nas mesmas datas, ambos a 0 % no primeiro dia."""
     datas = curva.index.union(benchmark.index)
@@ -416,7 +589,7 @@ def alinhar_benchmark(curva: pd.Series, benchmark: pd.Series):
     return c, b
 
 
-def grafico_evolucao(carteira_pct: pd.Series, bench_pct: pd.Series, nome_bench: str, rotulo: str = "12 meses"):
+def grafico_evolucao(carteira_pct: pd.Series, bench_pct: pd.Series, nome_bench: str, titulo: str):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=carteira_pct.index, y=carteira_pct, name="A minha carteira",
                              mode="lines", line=dict(width=3, color="#1f77b4")))
@@ -425,9 +598,29 @@ def grafico_evolucao(carteira_pct: pd.Series, bench_pct: pd.Series, nome_bench: 
     fig.add_hline(y=0, line_width=1, line_color="gray")
     fig.update_traces(hovertemplate="%{y:+.2f} %")
     fig.update_layout(
-        title=f"Performance acumulada ({rotulo}, em euros)",
+        title=titulo,
         hovermode="x unified",
         yaxis=dict(ticksuffix=" %", title="Retorno acumulado"),
+        xaxis_title="",
+        legend=dict(orientation="h", y=-0.15),
+        margin=dict(t=60, l=10, r=10, b=10),
+    )
+    return fig
+
+
+def grafico_valor(valor: pd.Series, investido: pd.Series):
+    """Valor da carteira em euros contra o dinheiro líquido investido."""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=valor.index, y=valor, name="Valor da carteira",
+                             mode="lines", line=dict(width=3, color="#1f77b4"),
+                             fill="tozeroy", fillcolor="rgba(31,119,180,0.08)"))
+    fig.add_trace(go.Scatter(x=investido.index, y=investido, name="Dinheiro investido (líquido)",
+                             mode="lines", line=dict(width=2, color="#555555", shape="hv", dash="dash")))
+    fig.update_traces(hovertemplate="%{y:,.2f} €")
+    fig.update_layout(
+        title="Valor da carteira em euros",
+        hovermode="x unified",
+        yaxis=dict(ticksuffix=" €", title=""),
         xaxis_title="",
         legend=dict(orientation="h", y=-0.15),
         margin=dict(t=60, l=10, r=10, b=10),
@@ -536,6 +729,24 @@ def cor_pl(valor):
     return "color: #2e7d32" if valor >= 0 else "color: #c62828"
 
 
+def mostrar_vendas(vendas: pd.DataFrame):
+    estilo = vendas.style.map(cor_pl, subset=["Ganho Realizado (€)"]).format(
+        {
+            "Data": lambda d: "—" if pd.isna(d) else f"{d:%d/%m/%Y}",
+            "Quantidade": "{:,.4f}".format,
+            "Valor Recebido (€)": "{:,.2f}".format,
+            "Custo de Aquisição (€)": "{:,.2f}".format,
+            "Ganho Realizado (€)": "{:+,.2f}".format,
+        }
+    )
+    st.dataframe(estilo, width="stretch", hide_index=True)
+    st.caption(
+        "As vendas consomem primeiro as compras mais antigas, como na regra fiscal "
+        "portuguesa. O custo inclui as comissões de compra e o valor recebido já desconta "
+        "as comissões de venda. É uma estimativa: não substitui o apuramento para o IRS."
+    )
+
+
 # ---------------------------------------------------------------- interface
 st.title("📊 O meu portefólio de investimentos")
 
@@ -545,8 +756,6 @@ with st.sidebar:
     usar_exemplo = st.checkbox("Usar dados de exemplo", disabled=not EXEMPLO.exists())
     tipo_grafico = st.radio("Tipo de gráfico", ["Pie Chart", "Treemap"])
     base_graficos = st.radio("Gráficos de alocação por", ["Valor actual", "Valor investido"])
-    st.header("Período de análise")
-    rotulo_periodo = st.selectbox("Histórico a analisar", list(PERIODOS), index=1)
     st.header("Benchmark")
     escolha = st.selectbox("Comparar com", list(BENCHMARKS) + ["Outro símbolo"])
     if escolha == "Outro símbolo":
@@ -558,8 +767,9 @@ with st.sidebar:
     if st.button("🔄 Actualizar preços e notícias"):
         st.cache_data.clear()
     st.caption(
-        "Colunas necessárias: Ticker, Quantidade, Preço Médio de Compra, "
-        "Tipo de Activo, Setor, País. O preço médio de compra é lido em euros."
+        "Uma linha por operação. Colunas necessárias: Ticker, Quantidade, Preço Unitário, "
+        "Tipo de Activo, Setor, País. Colunas opcionais: Operação (Compra ou Venda), "
+        "Data (dd/mm/aaaa) e Comissões. Os preços e as comissões são lidos em euros."
     )
 
 if ficheiro is None and not usar_exemplo:
@@ -568,21 +778,27 @@ if ficheiro is None and not usar_exemplo:
 
 try:
     if ficheiro is not None:
-        carteira = ler_csv(ficheiro)
+        operacoes = ler_csv(ficheiro)
     else:
-        carteira = ler_csv(EXEMPLO.read_bytes())
+        operacoes = ler_csv(EXEMPLO.read_bytes())
 except Exception as erro:
     st.error(f"Não consegui ler o ficheiro. {erro}")
     st.stop()
 
-if carteira.empty:
+if operacoes.empty:
     st.error("O ficheiro não tem linhas válidas.")
     st.stop()
 
-with st.spinner("A converter moedas para euros..."):
-    carteira, conversoes = aplicar_cambio(carteira)
+carteira, vendas, avisos = processar_operacoes(operacoes)
+for aviso in avisos:
+    st.warning(aviso)
+operacoes["simbolo"] = [simbolo_yahoo(t, tp) for t, tp in zip(operacoes["ticker"], operacoes["tipo"])]
+ganho_realizado = vendas["Ganho Realizado (€)"].sum()
+
 if carteira.empty:
-    st.error("Nenhuma posição ficou com preço em euros.")
+    st.warning("Todas as posições do ficheiro já foram vendidas. Fica só o ganho realizado.")
+    st.metric("Ganho realizado", f"{ganho_realizado:+,.2f} €")
+    mostrar_vendas(vendas)
     st.stop()
 
 # Preços actuais
@@ -605,45 +821,51 @@ elif not sem_preco.empty:
         + ". Confirme o símbolo (ex.: EDP.LS para Lisboa, VWCE.DE para Xetra)."
     )
 
-# Historial do período escolhido (usado no Dashboard e nas Métricas de Risco)
-tem_datas = bool(carteira["data_compra"].notna().any())
-with st.sidebar:
-    modo_curva = st.radio(
-        "Curva da carteira",
-        ["Pesos actuais (simulação)", "Compras reais (usa a Data de Compra)"],
-        disabled=not tem_datas,
-        help="Compras reais precisa da coluna 'Data de Compra' no CSV.",
-    )
-modo_real = tem_datas and modo_curva.startswith("Compras reais")
+# Datas: a curva começa na primeira operação; as operações sem data contam
+# como feitas há 12 meses. As métricas de risco usam sempre os últimos 12 meses.
+hoje = pd.Timestamp.today().normalize()
+inicio_12m = hoje - pd.Timedelta(days=365)
+datas_ops = operacoes["data"].dropna()
+if datas_ops.empty:
+    inicio_curva = inicio_12m
+elif operacoes["data"].isna().any():
+    inicio_curva = min(datas_ops.min(), inicio_12m)
+else:
+    inicio_curva = datas_ops.min()
+inicio_download = min(inicio_curva, inicio_12m) - pd.Timedelta(days=10)
 
-pesos_valor = carteira.dropna(subset=["simbolo"]).groupby("simbolo")["valor_atual"].sum()
+simbolos_hist = {s for s in operacoes["simbolo"] if isinstance(s, str) and s} | {simbolo_bench}
 with st.spinner("A descarregar o historial de preços..."):
-    historico = buscar_historico(
-        tuple(sorted(set(pesos_valor.index) | {simbolo_bench})), PERIODOS[rotulo_periodo]
-    )
+    historico = buscar_historico(tuple(sorted(simbolos_hist)), f"{inicio_download:%Y-%m-%d}")
 
-cobertos = [s for s in pesos_valor.index if s in historico.columns]
-historico_ok = bool(cobertos) and simbolo_bench in historico.columns
+if historico.empty:
+    datas_curva = pd.bdate_range(inicio_curva, hoje)
+else:
+    datas_curva = historico.index[historico.index >= inicio_curva]
+    if len(datas_curva) == 0:
+        datas_curva = pd.bdate_range(inicio_curva, hoje)
+valor_dia, fluxos_dia, retornos_dia = evolucao_real(operacoes, historico, datas_curva)
+
+# Totais
+investido = carteira["valor_investido"].sum()
+atual = carteira["valor_atual"].sum()
+pl_abs = atual - investido
+pl_pct = pl_abs / investido * 100 if investido else 0.0
+tir = tir_anual(operacoes, atual, hoje, inicio_curva)
+ativo = valor_dia[valor_dia > 0]
+twr_total = None
+if not ativo.empty:
+    twr_total = ((1 + retornos_dia.loc[ativo.index[0]:]).prod() - 1) * 100
+
+# Pesos actuais e historial dos últimos 12 meses (Métricas de Risco)
+hist_12m = historico[historico.index >= inicio_12m].dropna(axis=1, how="all") if not historico.empty else historico
+pesos_valor = carteira.dropna(subset=["simbolo"]).groupby("simbolo")["valor_atual"].sum()
+cobertos = [s for s in pesos_valor.index if s in hist_12m.columns]
+historico_ok = bool(cobertos) and simbolo_bench in hist_12m.columns
 pesos = pesos_valor[cobertos] / pesos_valor[cobertos].sum() if historico_ok else None
-lotes = carteira.dropna(subset=["simbolo"])[["simbolo", "quantidade", "data_compra"]]
-
-
-def retornos_do_modo(precos_df: pd.DataFrame) -> pd.Series:
-    """Retornos diários pela curva escolhida (compras reais ou pesos actuais)."""
-    if modo_real:
-        return retornos_reais(precos_df, lotes)
-    return retornos_carteira(precos_df, pesos)
-
-
-texto_metodo = (
-    "Usa as quantidades e as datas de compra reais; lotes sem data contam desde o início do período."
-    if modo_real
-    else "Aplica os pesos actuais (valor actual de cada posição), constantes, aos preços do período. "
-    "Não é o histórico real das compras."
-)
 texto_cobertura = ""
 if historico_ok:
-    cobertura = pesos_valor[cobertos].sum() / carteira["valor_atual"].sum() * 100
+    cobertura = pesos_valor[cobertos].sum() / atual * 100
     fora = [t for t, tp in zip(carteira["ticker"], carteira["tipo"]) if simbolo_yahoo(t, tp) not in cobertos]
     texto_cobertura = f"Cobre {cobertura:.0f} % do valor da carteira" + (
         f"; ficam de fora: {', '.join(fora)}." if fora else "."
@@ -655,30 +877,39 @@ tab_dash, tab_aloc, tab_risco, tab_noticias = st.tabs(
 
 # ------------------------------------------------------------ Dashboard Geral
 with tab_dash:
-    investido = carteira["valor_investido"].sum()
-    atual = carteira["valor_atual"].sum()
-    pl_abs = atual - investido
-    pl_pct = pl_abs / investido * 100 if investido else 0.0
-
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Valor investido", f"{investido:,.2f} €")
+    m1.metric("Valor investido", f"{investido:,.2f} €",
+              help="Custo das unidades que ainda tens, com as comissões de compra.")
     m2.metric("Valor actual", f"{atual:,.2f} €")
-    m3.metric("P&L (€)", f"{pl_abs:+,.2f} €", delta=f"{pl_abs:+,.2f} €")
-    m4.metric("P&L (%)", f"{pl_pct:+.2f} %", delta=f"{pl_pct:+.2f} %")
+    m3.metric("Ganho não realizado (€)", f"{pl_abs:+,.2f} €", delta=f"{pl_abs:+,.2f} €",
+              help="Ganho ou perda das posições que ainda tens, ao preço de hoje.")
+    m4.metric("Ganho não realizado (%)", f"{pl_pct:+.2f} %", delta=f"{pl_pct:+.2f} %")
+
+    n1, n2, n3, n4 = st.columns(4)
+    n1.metric("Ganho realizado", f"{ganho_realizado:+,.2f} €",
+              help="Ganho ou perda das vendas já feitas, depois das comissões.")
+    n2.metric("Ganho total", f"{pl_abs + ganho_realizado:+,.2f} €",
+              help="Ganho não realizado mais ganho realizado.")
+    n3.metric("Rentabilidade anual pessoal", "—" if tir is None else f"{tir * 100:+.2f} % / ano",
+              help="Rentabilidade ponderada pelo dinheiro (taxa interna de rentabilidade). "
+                   "Tem em conta quando e quanto investiste. Precisa de pelo menos 90 dias "
+                   "de historial.")
+    n4.metric("Rentabilidade ponderada pelo tempo", "—" if twr_total is None else f"{twr_total:+.2f} %",
+              help="Rentabilidade acumulada desde a primeira operação, sem o efeito dos "
+                   "reforços e das vendas. É a medida que se compara com o benchmark.")
     st.caption(
         f"Preços obtidos às {hora:%H:%M} (atraso típico de cerca de 15 minutos; "
         "convertidos para euros). Posições sem cotação, como P2P, contam ao preço de compra."
     )
 
     mostrar = carteira[
-        ["ticker", "tipo", "data_compra", "moeda", "quantidade", "preco_medio", "preco_atual",
+        ["ticker", "tipo", "quantidade", "preco_medio", "preco_atual",
          "valor_investido", "valor_atual", "pl_abs", "pl_pct", "estado"]
     ].rename(columns=NOMES_BONITOS | {"preco_medio": "Preço Médio de Compra (€)"})
     estilo = (
         mostrar.style.map(cor_pl, subset=["P&L (€)", "P&L (%)"])
         .format(
             {
-                "Data de Compra": lambda v: "—" if pd.isna(v) else f"{v:%d/%m/%Y}",
                 "Quantidade": "{:,.4f}".format,
                 "Preço Médio de Compra (€)": "{:,.2f}".format,
                 "Preço Actual (€)": lambda v: "—" if pd.isna(v) else f"{v:,.2f}",
@@ -689,46 +920,60 @@ with tab_dash:
             }
         )
     )
-    if conversoes:
-        with st.expander("Conversões de moeda no preço de compra"):
-            for c in conversoes:
-                st.write(
-                    f"**{c['ticker']}**: {c['original']:,.2f} {c['moeda']} → {c['euros']:,.2f} € "
-                    f"(1 {c['moeda']} = {c['taxa']:.4f} €, câmbio de {c['data']})"
-                )
-            st.caption(
-                "O câmbio é o de fecho do Yahoo Finance e pode diferir do aplicado pela corretora. "
-                "Comissões e impostos não estão incluídos."
-            )
-    st.subheader("Posições")
+    st.subheader("Posições actuais")
     st.dataframe(estilo, width="stretch", hide_index=True)
+    st.caption("O preço médio de compra é o das unidades que ainda tens, depois das vendas.")
     st.plotly_chart(grafico_pl(carteira), width="stretch")
 
-    st.subheader(f"📈 Evolução ({rotulo_periodo})")
-    if not cobertos:
-        st.info("Não consegui obter o historial de nenhum activo da carteira.")
-    elif simbolo_bench not in historico.columns:
-        st.info(f"Não consegui obter o historial do benchmark {simbolo_bench}.")
+    if not vendas.empty:
+        with st.expander(f"Vendas realizadas ({len(vendas)})"):
+            mostrar_vendas(vendas)
+
+    st.subheader("📈 Evolução desde a primeira operação")
+    if ativo.empty:
+        st.info("Não há dados suficientes para desenhar a evolução da carteira.")
     else:
-        curva_modo = ((1 + retornos_do_modo(historico[cobertos])).cumprod() - 1) * 100
-        par = alinhar_benchmark(curva_modo, historico[simbolo_bench])
-        if par is None:
-            st.info("O benchmark não tem datas em comum com a carteira.")
+        inicio_real = ativo.index[0]
+        investido_acum = fluxos_dia.cumsum()
+        st.plotly_chart(
+            grafico_valor(valor_dia.loc[inicio_real:], investido_acum.loc[inicio_real:]),
+            width="stretch",
+        )
+        st.caption(
+            "A linha a tracejado sobe em cada compra e desce em cada venda. A distância entre "
+            "as duas linhas é o ganho ou a perda acumulados."
+        )
+        curva_twr = ((1 + retornos_dia.loc[inicio_real:]).cumprod() - 1) * 100
+        if simbolo_bench not in historico.columns:
+            st.info(f"Não consegui obter o historial do benchmark {simbolo_bench}.")
         else:
-            curva_c, curva_b = par
-            ret_c, ret_b = curva_c.iloc[-1], curva_b.iloc[-1]
-            k1, k2, k3 = st.columns(3)
-            k1.metric(f"Carteira ({rotulo_periodo})", f"{ret_c:+.2f} %")
-            k2.metric(nome_bench, f"{ret_b:+.2f} %")
-            k3.metric("Diferença", f"{ret_c - ret_b:+.2f} p.p.", delta=f"{ret_c - ret_b:+.2f} p.p.")
-            if ret_c >= ret_b:
-                st.success("A carteira bateu o benchmark neste período.")
+            par = alinhar_benchmark(curva_twr, historico[simbolo_bench])
+            if par is None:
+                st.info("O benchmark não tem datas em comum com a carteira.")
             else:
-                st.warning("A carteira ficou abaixo do benchmark neste período.")
-            st.plotly_chart(grafico_evolucao(curva_c, curva_b, nome_bench, rotulo_periodo), width="stretch")
-            st.caption(
-                f"{texto_metodo} Dividendos incluídos. " + texto_cobertura
-            )
+                curva_c, curva_b = par
+                ret_c, ret_b = curva_c.iloc[-1], curva_b.iloc[-1]
+                k1, k2, k3 = st.columns(3)
+                k1.metric("Carteira", f"{ret_c:+.2f} %")
+                k2.metric(nome_bench, f"{ret_b:+.2f} %")
+                k3.metric("Diferença", f"{ret_c - ret_b:+.2f} p.p.", delta=f"{ret_c - ret_b:+.2f} p.p.")
+                if ret_c >= ret_b:
+                    st.success("A carteira bateu o benchmark neste período.")
+                else:
+                    st.warning("A carteira ficou abaixo do benchmark neste período.")
+                st.plotly_chart(
+                    grafico_evolucao(
+                        curva_c, curva_b, nome_bench,
+                        f"Rentabilidade ponderada pelo tempo desde {inicio_real:%d/%m/%Y} (em euros)",
+                    ),
+                    width="stretch",
+                )
+                st.caption(
+                    "Usa as datas reais das operações e retira o efeito do dinheiro que entra "
+                    "e sai. Assim, a comparação com o benchmark é justa. Os preços incluem "
+                    "dividendos. Os activos sem cotação (P2P) contam ao custo, com rentabilidade "
+                    "zero. As operações sem data contam como feitas no primeiro dia do gráfico, ao preço desse dia."
+                )
 
 # ------------------------------------------------------ Alocação Setor/País
 with tab_aloc:
@@ -750,7 +995,7 @@ with tab_aloc:
 
 # ------------------------------------------------------------ Métricas de risco
 with tab_risco:
-    st.subheader(f"⚠️ Análise de risco ({rotulo_periodo})")
+    st.subheader("⚠️ Análise de risco (últimos 12 meses)")
     taxa_pct = st.radio(
         "Taxa livre de risco (para o Sharpe Ratio)", [2, 3],
         format_func=lambda x: f"{x} %", horizontal=True,
@@ -758,9 +1003,9 @@ with tab_risco:
     if not historico_ok:
         st.info("Preciso do historial da carteira e do benchmark para calcular o risco.")
     else:
-        datas_bench = historico[simbolo_bench].dropna().index
-        ret_carteira = retornos_do_modo(historico[cobertos].ffill().reindex(datas_bench))
-        ret_bench = historico[simbolo_bench].dropna().pct_change()
+        datas_bench = hist_12m[simbolo_bench].dropna().index
+        ret_carteira = retornos_carteira(hist_12m[cobertos].ffill().reindex(datas_bench), pesos)
+        ret_bench = hist_12m[simbolo_bench].dropna().pct_change()
         r = metricas_risco(ret_carteira, ret_bench, taxa_pct / 100)
         if r is None:
             st.info("Há menos de 30 dias de preços em comum. É pouco para calcular o risco.")
@@ -776,7 +1021,7 @@ with tab_risco:
                       help=f"Retorno acima da taxa livre de risco ({taxa_pct} %) por cada unidade de "
                            "volatilidade. Acima de 1 é bom. Abaixo de 0 é pior que a taxa livre de risco.")
             r4.metric("Queda máxima", f"{c['queda_maxima'] * 100:.2f} %",
-                      help="A maior descida desde um máximo até ao mínimo seguinte, no período escolhido.")
+                      help="A maior descida desde um máximo até ao mínimo seguinte, no último ano.")
 
             tabela = pd.DataFrame(
                 {
@@ -795,14 +1040,9 @@ with tab_risco:
             st.plotly_chart(grafico_quedas(c["queda"], b["queda"], nome_bench), width="stretch")
             st.caption(
                 f"Calculado com {r['dias']} dias de negociação do benchmark, retornos diários e "
-                f"{DIAS_BOLSA} dias por ano. {texto_metodo} Mede o passado e não prevê o futuro. "
-                + texto_cobertura
+                f"{DIAS_BOLSA} dias por ano, com os pesos actuais constantes. Mede o passado e não "
+                "prevê o futuro. " + texto_cobertura
             )
-            if r["dias"] < 120:
-                st.warning(
-                    "Período curto: com menos de 6 meses, a volatilidade anualizada e o Sharpe "
-                    "são pouco fiáveis. Use-os só como indicação."
-                )
             with st.expander("O que significa cada métrica"):
                 st.markdown(
                     "- **Volatilidade anualizada:** desvio-padrão dos retornos diários multiplicado "
