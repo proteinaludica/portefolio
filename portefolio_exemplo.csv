@@ -1,10 +1,11 @@
-Ticker,Quantidade,Preço Médio de Compra,Tipo de Activo,Setor,País,Data de Compra
-AAPL,10,150.50,Ações,Tecnologia,Estados Unidos,15/03/2024
-EDP.LS,200,4.20,Ações,Energia,Portugal,02/09/2025
-JNJ,15,160.00,Ações,Saúde,Estados Unidos,10/01/2026
-VWCE.DE,50,105.30,ETF,Diversificado,Global,20/06/2023
-IWDA.AS,30,78.40,ETF,Diversificado,Global,05/05/2026
-BTC,0.05,30000,Crypto,Cripto,Global,01/02/2024
-ETH,0.8,1800,Crypto,Cripto,Global,12/07/2026
-Mintos,1,2000,P2P,Crédito,Letónia,01/03/2025
-Bondora,1,1500,P2P,Crédito,Estónia,15/10/2026
+Ticker,Quantidade,Preço Médio de Compra,Tipo de Activo,Setor,País,Data de Compra,Moeda
+AAPL,10,150.50,Ações,Tecnologia,Estados Unidos,15/03/2024,EUR
+EDP.LS,200,4.20,Ações,Energia,Portugal,02/09/2025,EUR
+JNJ,15,160.00,Ações,Saúde,Estados Unidos,10/01/2026,EUR
+VWCE.DE,50,105.30,ETF,Diversificado,Global,20/06/2023,EUR
+IWDA.AS,30,78.40,ETF,Diversificado,Global,05/05/2026,EUR
+BTC,0.05,30000,Crypto,Cripto,Global,01/02/2024,EUR
+ETH,0.8,1800,Crypto,Cripto,Global,12/07/2026,EUR
+Mintos,1,2000,P2P,Crédito,Letónia,01/03/2025,EUR
+Bondora,1,1500,P2P,Crédito,Estónia,15/10/2026,EUR
+MSFT,5,400.00,Ações,Tecnologia,Estados Unidos,10/04/2026,USD

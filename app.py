@@ -35,10 +35,13 @@ COLUNAS = {
 }
 COLUNAS_OPCIONAIS = {
     "data_compra": ["data de compra", "data da compra", "data compra", "data"],
+    "moeda": ["moeda", "moeda de compra", "currency", "divisa"],
 }
+MOEDAS_SIMBOLO = {"€": "EUR", "$": "USD", "£": "GBP"}
 PERIODOS = {"3 meses": "3mo", "12 meses": "1y", "5 anos": "5y"}
 NOMES_BONITOS = {
     "data_compra": "Data de Compra",
+    "moeda": "Moeda",
     "ticker": "Ticker",
     "quantidade": "Quantidade",
     "preco_medio": "Preço Médio de Compra",
@@ -100,9 +103,13 @@ def ler_csv(ficheiro) -> pd.DataFrame:
     if em_falta:
         raise ValueError("Faltam colunas no ficheiro: " + ", ".join(em_falta))
 
-    if "data_compra" not in df.columns:
-        df["data_compra"] = None
-    df = df[list(COLUNAS) + ["data_compra"]].copy()
+    for opcional in ("data_compra", "moeda"):
+        if opcional not in df.columns:
+            df[opcional] = None
+    df = df[list(COLUNAS) + ["data_compra", "moeda"]].copy()
+    df["moeda"] = (
+        df["moeda"].fillna("EUR").str.strip().replace("", "EUR").replace(MOEDAS_SIMBOLO).str.upper()
+    )
     bruto = df["data_compra"]
     df["data_compra"] = pd.to_datetime(bruto, dayfirst=True, errors="coerce", format="mixed")
     datas_ma = bruto.notna() & df["data_compra"].isna()
@@ -126,6 +133,60 @@ def ler_csv(ficheiro) -> pd.DataFrame:
 
     df["valor_investido"] = df["quantidade"] * df["preco_medio"]
     return df.reset_index(drop=True)
+
+
+# ------------------------------------------------------------------- câmbio
+@st.cache_data(ttl=86400, show_spinner=False)
+def buscar_cambio(moeda: str, data: str) -> float | None:
+    """Quantos euros vale 1 unidade da moeda, no último fecho até à data (aaaa-mm-dd).
+
+    Sem data, devolve o câmbio mais recente. Devolve None se o Yahoo não responder.
+    """
+    try:
+        simbolo = f"{moeda}EUR=X"
+        if data:
+            dia = pd.Timestamp(data)
+            hist = yf.Ticker(simbolo).history(start=dia - pd.Timedelta(days=10), end=dia + pd.Timedelta(days=1))
+            serie = _limpar_serie(hist["Close"])
+            serie = serie[serie.index <= dia]
+        else:
+            serie = _limpar_serie(yf.Ticker(simbolo).history(period="5d")["Close"])
+        return float(serie.iloc[-1])
+    except Exception:
+        return None
+
+
+def aplicar_cambio(df: pd.DataFrame):
+    """Converte para euros o preço de compra das linhas noutra moeda.
+
+    Usa o câmbio do dia da compra (ou o mais recente, se não houver data).
+    Devolve a tabela e a lista de conversões feitas, para mostrar ao utilizador.
+    """
+    df = df.copy()
+    conversoes, sem_cambio = [], []
+    for i, linha in df[df["moeda"] != "EUR"].iterrows():
+        data = "" if pd.isna(linha["data_compra"]) else linha["data_compra"].strftime("%Y-%m-%d")
+        taxa = buscar_cambio(linha["moeda"], data)
+        if taxa is None:
+            sem_cambio.append(i)
+            continue
+        original = linha["preco_medio"]
+        df.at[i, "preco_medio"] = original * taxa
+        conversoes.append(
+            {
+                "ticker": linha["ticker"], "original": original, "moeda": linha["moeda"],
+                "euros": original * taxa, "taxa": taxa, "data": data or "mais recente",
+            }
+        )
+    if sem_cambio:
+        st.error(
+            "Sem câmbio para converter para euros: "
+            + ", ".join(df.loc[sem_cambio, "ticker"])
+            + ". Estas posições ficam de fora até o Yahoo responder."
+        )
+        df = df.drop(index=sem_cambio)
+    df["valor_investido"] = df["quantidade"] * df["preco_medio"]
+    return df.reset_index(drop=True), conversoes
 
 
 # ------------------------------------------------------------ dados de mercado
@@ -518,6 +579,12 @@ if carteira.empty:
     st.error("O ficheiro não tem linhas válidas.")
     st.stop()
 
+with st.spinner("A converter moedas para euros..."):
+    carteira, conversoes = aplicar_cambio(carteira)
+if carteira.empty:
+    st.error("Nenhuma posição ficou com preço em euros.")
+    st.stop()
+
 # Preços actuais
 simbolos = tuple(
     sorted({s for s in (simbolo_yahoo(t, tp) for t, tp in zip(carteira["ticker"], carteira["tipo"])) if s})
@@ -604,7 +671,7 @@ with tab_dash:
     )
 
     mostrar = carteira[
-        ["ticker", "tipo", "data_compra", "quantidade", "preco_medio", "preco_atual",
+        ["ticker", "tipo", "data_compra", "moeda", "quantidade", "preco_medio", "preco_atual",
          "valor_investido", "valor_atual", "pl_abs", "pl_pct", "estado"]
     ].rename(columns=NOMES_BONITOS | {"preco_medio": "Preço Médio de Compra (€)"})
     estilo = (
@@ -622,6 +689,17 @@ with tab_dash:
             }
         )
     )
+    if conversoes:
+        with st.expander("Conversões de moeda no preço de compra"):
+            for c in conversoes:
+                st.write(
+                    f"**{c['ticker']}**: {c['original']:,.2f} {c['moeda']} → {c['euros']:,.2f} € "
+                    f"(1 {c['moeda']} = {c['taxa']:.4f} €, câmbio de {c['data']})"
+                )
+            st.caption(
+                "O câmbio é o de fecho do Yahoo Finance e pode diferir do aplicado pela corretora. "
+                "Comissões e impostos não estão incluídos."
+            )
     st.subheader("Posições")
     st.dataframe(estilo, width="stretch", hide_index=True)
     st.plotly_chart(grafico_pl(carteira), width="stretch")

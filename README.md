@@ -36,11 +36,12 @@ Aplicação pessoal em Python (Streamlit) para analisar uma carteira de investim
 |---|---|---|
 | Ticker | sim | `AAPL`, `EDP.LS`, `VWCE.DE`, `BTC` |
 | Quantidade | sim | `10` |
-| Preço Médio de Compra | sim | `150.50` (em euros) |
+| Preço Médio de Compra | sim | `150.50` (na moeda da coluna Moeda) |
 | Tipo de Activo | sim | `Ações`, `ETF`, `Crypto` ou `P2P` |
 | Setor | sim | `Tecnologia` |
 | País | sim | `Estados Unidos` |
 | Data de Compra | não | `15/03/2024` (dd/mm/aaaa) |
+| Moeda | não | `EUR` (por defeito), `USD`, `GBP` |
 
 O ficheiro `portefolio_exemplo.csv` serve de modelo. Aceita vírgula ou ponto e vírgula como separador e vírgula como separador decimal.
 
@@ -58,7 +59,7 @@ Na barra lateral escolhes entre dois modos:
 ## Limites
 
 - Os preços do Yahoo Finance têm cerca de 15 minutos de atraso e o serviço não é oficial. Pode falhar ou limitar pedidos.
-- O Preço Médio de Compra é lido em euros. Os preços de mercado são convertidos para euros.
+- Se a coluna Moeda não existir, o Preço Médio de Compra é lido em euros. Com `USD` ou `GBP`, a aplicação converte-o para euros com o câmbio de fecho do Yahoo no dia da compra (ou o mais recente, sem Data de Compra). Pode diferir do câmbio da corretora e não inclui comissões. Os preços de mercado também são convertidos para euros.
 - Em períodos curtos (menos de 6 meses), a volatilidade anualizada e o Sharpe Ratio são pouco fiáveis.
 - Activos sem historial no Yahoo ficam de fora das curvas e das métricas de risco. A aplicação indica quanto da carteira está coberto.
 
