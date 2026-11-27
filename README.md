@@ -1,68 +1,81 @@
 # Portefólio de investimentos
 
-Aplicação pessoal em Python (Streamlit) para analisar uma carteira de investimentos. Lê um ficheiro CSV, procura preços e notícias reais no Yahoo Finance e calcula o valor actual, o P&L, a alocação e o risco.
+Aplicação pessoal em Python (Streamlit) para analisar a tua carteira de investimentos. Lê um ficheiro CSV com as tuas operações, procura preços actuais no Yahoo Finance e calcula quanto valem os teus investimentos, quanto ganhaste ou perdeste e como se comparam com um índice de mercado.
 
-> Mede o passado e não prevê o futuro. Não é aconselhamento financeiro.
+> Mede o passado e não prevê o futuro. Não é aconselhamento financeiro nem consultoria fiscal.
 
 ## O que faz
 
-- **Dashboard Geral:** valor investido, valor actual, P&L (€ e %) por posição e global, e a evolução da carteira contra um benchmark (S&P 500, VWCE ou MSCI World).
-- **Alocação por Setor/País:** gráficos interactivos (Pie Chart ou Treemap) por setor, país e tipo de activo.
-- **Métricas de Risco:** volatilidade anualizada, beta, Sharpe Ratio (taxa livre de risco de 2 % ou 3 %) e queda máxima.
-- **Notícias do Mercado:** as notícias mais recentes de cada activo, com título, fonte e ligação.
-- **Período de análise:** 3 meses, 12 meses ou 5 anos.
+- **Posições actuais:** quantidade, preço médio, valor actual e ganho ou perda não realizado, por activo.
+- **Vendas realizadas:** ganho ou perda de cada venda, com as compras mais antigas consumidas primeiro.
+- **Evolução:** valor da carteira em euros e rentabilidade ponderada pelo tempo, contra um índice de referência (S&P 500, VWCE ou MSCI World).
+- **Rentabilidade anual pessoal:** calculada com base nas datas e nos valores das tuas operações. Precisa de pelo menos 90 dias de historial.
+- **Alocação:** gráficos circulares ou treemaps por tipo de activo, setor e país.
+- **Métricas de risco:** volatilidade, beta, Sharpe Ratio e queda máxima, nos últimos 12 meses.
+- **Notícias:** as notícias mais recentes de cada activo.
+
+## Formato do ficheiro CSV
+
+Cada linha é uma operação: uma compra ou uma venda. Um activo com várias compras ocupa várias linhas.
+
+| Coluna | Obrigatória | Exemplo | Notas |
+|---|---|---|---|
+| Ticker | Sim | `AAPL` | Símbolo no Yahoo Finance. Acções portuguesas levam `.LS`, por exemplo `EDP.LS`. |
+| Operação | Não | `Compra` ou `Venda` | Se estiver vazia, conta como compra. |
+| Quantidade | Sim | `10` | |
+| Preço Unitário | Sim | `140,00` | Preço de uma unidade, na moeda indicada na coluna Moeda. |
+| Data | Não | `15/03/2024` | Formato dd/mm/aaaa. Sem data, a operação conta desde o início do gráfico. |
+| Comissões | Não | `2,00` | Na moeda indicada na coluna Moeda. |
+| Tipo de Activo | Sim | `Ações` | Ações, ETF, Crypto ou P2P. |
+| Setor | Sim | `Tecnologia` | |
+| País | Sim | `Estados Unidos` | |
+| Moeda | Não | `USD` | EUR, USD ou GBP. Se estiver vazia, conta como EUR. |
+
+Os números podem ter vírgula ou ponto como separador decimal. O ficheiro pode ter ponto e vírgula ou vírgula como separador de colunas.
+
+Preços e comissões são convertidos para euros com o câmbio do dia da operação. Se não houver câmbio para uma moeda, a linha fica de fora e a aplicação mostra o número da linha.
+
+O P2P não tem cotação. Conta ao preço de compra.
 
 ## Instalação (Windows)
 
-1. Instala o Python em python.org/downloads. No instalador, marca a caixa **Add python.exe to PATH** antes de clicar em *Install Now*.
+1. Instala o Python em python.org/downloads. No instalador, marca a caixa **Add python.exe to PATH** antes de carregar em *Install Now*.
 2. Descarrega os ficheiros deste repositório para uma pasta, por exemplo `Documentos\portefolio`.
-3. Abre essa pasta no Explorador de Ficheiros, clica na barra de endereço, escreve `cmd` e carrega em Enter.
-4. Instala as bibliotecas (só uma vez):
+3. Abre essa pasta no Explorador de Ficheiros, carrega na barra de endereço, escreve `cmd` e carrega em Enter.
+4. Instala as bibliotecas (só na primeira vez):
    ```
    pip install -r requirements.txt
    ```
-5. Arranca a aplicação:
+5. Abre a aplicação:
    ```
    streamlit run app.py
    ```
-   Se aparecer "streamlit não é reconhecido", usa `python -m streamlit run app.py`.
-6. O browser abre em `localhost:8501`. Para fechar, carrega em Ctrl+C na janela preta.
+6. O navegador abre sozinho. Para fechar, volta à janela preta e carrega em Ctrl + C.
 
-**Mac:** usa o Terminal, `cd` para a pasta, `pip3 install -r requirements.txt` e `python3 -m streamlit run app.py`.
+## Instalação (Mac)
 
-## Formato do CSV
+1. Instala o Python em python.org/downloads. No fim da instalação, abre a pasta "Python 3.x" e faz duplo clique em **Install Certificates.command**.
+2. Cria uma pasta `Portefolio` em Documentos e copia para lá os ficheiros deste repositório.
+3. Abre o Terminal, escreve `cd ` (com espaço), arrasta a pasta `Portefolio` para a janela e carrega em Enter.
+4. Instala as bibliotecas (só na primeira vez):
+   ```
+   python3 -m pip install -r requirements.txt
+   ```
+5. Abre a aplicação:
+   ```
+   python3 -m streamlit run app.py
+   ```
+6. O Safari abre sozinho. Para fechar, volta ao Terminal e carrega em Ctrl + C.
 
-| Coluna | Obrigatória | Exemplo |
-|---|---|---|
-| Ticker | sim | `AAPL`, `EDP.LS`, `VWCE.DE`, `BTC` |
-| Quantidade | sim | `10` |
-| Preço Médio de Compra | sim | `150.50` (na moeda da coluna Moeda) |
-| Tipo de Activo | sim | `Ações`, `ETF`, `Crypto` ou `P2P` |
-| Setor | sim | `Tecnologia` |
-| País | sim | `Estados Unidos` |
-| Data de Compra | não | `15/03/2024` (dd/mm/aaaa) |
-| Moeda | não | `EUR` (por defeito), `USD`, `GBP` |
+## Usar os teus dados
 
-O ficheiro `portefolio_exemplo.csv` serve de modelo. Aceita vírgula ou ponto e vírgula como separador e vírgula como separador decimal.
+1. Prepara um ficheiro CSV com as tuas operações, no formato descrito acima. O exemplo `portefolio_exemplo.csv` serve de modelo.
+2. Na barra lateral da aplicação, carrega o ficheiro com o botão "Carregue o ficheiro CSV".
+3. Para ver os preços mais recentes, carrega em "Actualizar preços e notícias".
 
-### Símbolos do Yahoo Finance
+## Limitações conhecidas
 
-O Yahoo exige o sufixo da bolsa nos títulos europeus: `.LS` (Lisboa), `.DE` (Xetra), `.AS` (Amesterdão), `.PA` (Paris). As criptomoedas dispensam o sufixo (`BTC` passa a `BTC-EUR`). O P2P não tem cotação e conta ao preço de compra.
-
-## Curva da carteira
-
-Na barra lateral escolhes entre dois modos:
-
-- **Pesos actuais (simulação):** aplica os pesos de hoje aos preços do período. Responde à pergunta "como teria corrido com a carteira que tenho hoje".
-- **Compras reais:** usa as quantidades e as datas de compra do CSV. Cada compra entra na carteira à data indicada. Precisa da coluna *Data de Compra*; os lotes sem data contam desde o início do período.
-
-## Limites
-
-- Os preços do Yahoo Finance têm cerca de 15 minutos de atraso e o serviço não é oficial. Pode falhar ou limitar pedidos.
-- Se a coluna Moeda não existir, o Preço Médio de Compra é lido em euros. Com `USD` ou `GBP`, a aplicação converte-o para euros com o câmbio de fecho do Yahoo no dia da compra (ou o mais recente, sem Data de Compra). Pode diferir do câmbio da corretora e não inclui comissões. Os preços de mercado também são convertidos para euros.
-- Em períodos curtos (menos de 6 meses), a volatilidade anualizada e o Sharpe Ratio são pouco fiáveis.
-- Activos sem historial no Yahoo ficam de fora das curvas e das métricas de risco. A aplicação indica quanto da carteira está coberto.
-
-## Privacidade
-
-Não envies para o GitHub o CSV com as tuas posições reais. O `.gitignore` bloqueia todos os ficheiros `.csv`, excepto `portefolio_exemplo.csv`.
+- Os preços vêm do Yahoo Finance, com um atraso típico de cerca de 15 minutos.
+- A rentabilidade ponderada pelo tempo e as métricas de risco usam os pesos actuais da carteira.
+- As vendas usam a regra das compras mais antigas primeiro. É uma estimativa e não substitui o apuramento para o IRS.
+- Se o Yahoo Finance bloquear os pedidos durante algum tempo, a aplicação mostra os valores ao preço de compra.
